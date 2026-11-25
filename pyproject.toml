@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beets-moreart"
+version = "0.1.0"
+description = "Fetch additional album artwork for beets"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Jaedon D. Swanson" },
+]
+dependencies = [
+    "beets>=2.0.0",
+]
+
+keywords = ["beets", "music", "album-art", "artwork"]
+
+[project.entry-points."beets.plugins"]
+moreart = "beetsplug.moreart:MoreArtPlugin"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["beetsplug*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
