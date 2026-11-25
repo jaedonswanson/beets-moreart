@@ -6,6 +6,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
@@ -16,10 +20,20 @@ from beets.plugins import BeetsPlugin
 from beets.util import syspath
 
 
+class _Colors:
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    GREY = "\033[90m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
 class ArtworkStats:
     """Counts outcomes from a manual artwork-fetch run."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self.albums_checked = 0
         self.saved = 0
         self.already_present = 0
@@ -28,21 +42,73 @@ class ArtworkStats:
         self.missing_path = 0
         self.cached = 0
 
-    def print_summary(self) -> None:
+    def add(self, field: str, amount: int = 1) -> None:
+        with self._lock:
+            setattr(self, field, getattr(self, field) + amount)
+
+    def print_summary(self, use_color: bool = False) -> None:
+        colors = _Colors if use_color else type(
+            "_NoColors", (), {key: "" for key in vars(_Colors) if not key.startswith("_")}
+        )
+        with self._lock:
+            values = {
+                "albums_checked": self.albums_checked,
+                "saved": self.saved,
+                "already_present": self.already_present,
+                "cached": self.cached,
+                "no_image": self.no_image,
+                "would_fetch": self.would_fetch,
+                "missing_path": self.missing_path,
+            }
+        divider = f"{colors.BOLD}{'─' * 48}{colors.RESET}"
         lines = [
             "",
-            "=" * 40,
-            "  MoreArt summary",
-            "  Albums checked:       %d" % self.albums_checked,
-            "  Artwork saved:        %d" % self.saved,
-            "  Already present:      %d" % self.already_present,
-            "  Cached no-image:      %d" % self.cached,
-            "  No image saved:       %d" % self.no_image,
-            "  Would fetch (pretend): %d" % self.would_fetch,
-            "  Albums missing path:  %d" % self.missing_path,
-            "=" * 40,
+            divider,
+            f"  {colors.BOLD}MoreArt summary{colors.RESET}",
+            f"  {colors.BOLD}{'Albums checked:':<21}{colors.RESET} {values['albums_checked']}",
+            f"  {colors.GREEN}{'Artwork saved:':<21}{colors.RESET} {values['saved']}",
+            f"  {'Already present:':<21} {values['already_present']}",
+            f"  {'Cached no-image:':<21} {values['cached']}",
+            f"  {colors.YELLOW}{'No image saved:':<21}{colors.RESET} {values['no_image']}",
+            f"  {'Would fetch (pretend):':<21} {values['would_fetch']}",
+            f"  {'Albums missing path:':<21} {values['missing_path']}",
+            divider,
         ]
         print("\n".join(lines))
+
+
+class ArtworkProgress:
+    """Prints a thread-safe progress line after each album is checked."""
+
+    def __init__(self, total: int, use_color: bool) -> None:
+        self.total = total
+        self.current = 0
+        self.use_color = use_color
+        self._lock = threading.Lock()
+        self._start_time = time.monotonic()
+
+    def report(self, album: Any, saved: int) -> None:
+        with self._lock:
+            self.current += 1
+            current = self.current
+            filled = max(1, int(current / self.total * 12)) if self.total else 12
+            percent = int(current / self.total * 100) if self.total else 100
+            elapsed = int(time.monotonic() - self._start_time)
+            minutes, seconds = divmod(elapsed, 60)
+            bar = f"{'█' * filled}{'─' * (12 - filled)}"
+            artist = album.albumartist or "Unknown artist"
+            title = album.album or "Unknown album"
+            color = (
+                _Colors.GREEN if saved else _Colors.YELLOW
+            ) if self.use_color else ""
+            reset = _Colors.RESET if self.use_color else ""
+            status = f"Saved {saved}" if saved else "Checked"
+            print(
+                f"[{current:04d}/{self.total:04d}] [{bar}] "
+                f"{percent:3d}% {minutes:02d}:{seconds:02d} "
+                f"{color}{status}{reset}: {artist} - {title}",
+                flush=True,
+            )
 
 
 class MoreArtPlugin(BeetsPlugin):
@@ -50,6 +116,7 @@ class MoreArtPlugin(BeetsPlugin):
 
     ART_TYPES = ("discart", "spine", "back")
     IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
+    MAX_WORKERS = 16
 
     def __init__(self) -> None:
         super().__init__(name="moreart")
@@ -60,6 +127,8 @@ class MoreArtPlugin(BeetsPlugin):
                 "sources": ["fanarttv", "theaudiodb", "musicbrainz"],
                 "types": ["discart", "spine", "back"],
                 "run_on_import": True,
+                "workers": 4,
+                "progress": True,
                 "timeout": 15,
                 "cache_results": True,
                 "recheck_days": 30,
@@ -75,14 +144,54 @@ class MoreArtPlugin(BeetsPlugin):
         )
 
         self._magick_bin = shutil.which("magick") or shutil.which("convert")
+        self._request_state = threading.local()
         self._request_failures = 0
+        self._use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
         if self.config["run_on_import"].get(bool):
             self.import_stages = [self.import_stage]
+
+    @property
+    def _request_failures(self) -> int:
+        return getattr(self._request_state, "failures", 0)
+
+    @_request_failures.setter
+    def _request_failures(self, value: int) -> None:
+        self._request_state.failures = value
+
+    def _validate_workers(self, workers: int) -> int:
+        if workers < 1:
+            self._log.warning(f"Worker count {workers} is below 1; using 1.")
+            return 1
+        if workers > self.MAX_WORKERS:
+            self._log.warning(
+                f"Worker count {workers} exceeds {self.MAX_WORKERS}; "
+                f"using {self.MAX_WORKERS}."
+            )
+            return self.MAX_WORKERS
+        return workers
 
     def import_stage(self, _session: Any, task: Any) -> None:
         album = task.album
         if album:
             self._process_album(album)
+
+    @staticmethod
+    def _album_directory(album: Any) -> str:
+        album_dir = syspath(album.path)
+        if not os.path.isabs(album_dir):
+            filepath = getattr(album, "filepath", None)
+            if filepath is not None:
+                absolute_filepath = os.fspath(filepath)
+                if os.path.isabs(absolute_filepath):
+                    album_dir = absolute_filepath
+
+            if not os.path.isabs(album_dir):
+                library = getattr(album, "_db", None)
+                library_dir = getattr(library, "directory", None)
+                if library_dir:
+                    album_dir = os.path.join(syspath(library_dir), album_dir)
+
+        return os.path.abspath(album_dir)
 
     def commands(self) -> List[Any]:
         from beets.ui import Subcommand
@@ -103,21 +212,65 @@ class MoreArtPlugin(BeetsPlugin):
             default=False,
             help="ignore cached no-artwork results and search again",
         )
+        cmd.parser.add_option(
+            "-w",
+            "--workers",
+            type="int",
+            dest="workers",
+            help="number of albums to process concurrently",
+        )
+        cmd.parser.add_option(
+            "-q",
+            "--quiet",
+            action="store_true",
+            default=False,
+            help="suppress the progress display",
+        )
 
         def func(lib: Any, opts: Any, args: Sequence[str]) -> None:
             albums = list(lib.albums(args))
             if not albums:
                 return
 
+            workers = getattr(opts, "workers", None)
+            if workers is None:
+                workers = self.config["workers"].get(int)
+            workers = self._validate_workers(workers)
             stats = ArtworkStats()
-            for album in albums:
-                self._process_album(
-                    album,
-                    pretend=opts.pretend,
-                    force=opts.force,
-                    stats=stats,
-                )
-            stats.print_summary()
+            show_progress = (
+                self.config["progress"].get(bool)
+                and not getattr(opts, "quiet", False)
+            )
+            progress = (
+                ArtworkProgress(len(albums), bool(self._use_color))
+                if show_progress
+                else None
+            )
+
+            def process(album: Any) -> None:
+                try:
+                    saved = self._process_album(
+                        album,
+                        pretend=opts.pretend,
+                        force=opts.force,
+                        stats=stats,
+                    )
+                except FileNotFoundError as error:
+                    self._log.warning(
+                        f"Album path disappeared while processing {album}: {error}"
+                    )
+                    stats.add("missing_path")
+                    saved = 0
+                if progress:
+                    progress.report(album, saved)
+
+            if workers > 1:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    list(executor.map(process, albums))
+            else:
+                for album in albums:
+                    process(album)
+            stats.print_summary(use_color=bool(self._use_color))
 
         cmd.func = func
         return [cmd]
@@ -128,46 +281,53 @@ class MoreArtPlugin(BeetsPlugin):
         pretend: bool = False,
         force: bool = False,
         stats: Optional[ArtworkStats] = None,
-    ) -> None:
+    ) -> int:
         if stats:
-            stats.albums_checked += 1
+            stats.add("albums_checked")
         if not album.path:
             self._log.warning("Album has no path; skipping extra artwork fetch.")
             if stats:
-                stats.missing_path += 1
-            return
+                stats.add("missing_path")
+            return 0
 
-        album_dir = syspath(album.path)
+        album_dir = self._album_directory(album)
+        if not os.path.isdir(album_dir):
+            self._log.warning(
+                f"Album directory does not exist; skipping {album}: {album_dir}"
+            )
+            if stats:
+                stats.add("missing_path")
+            return 0
         sources = self.config["sources"].as_str_seq()
         art_types = self.config["types"].as_str_seq()
+        album_saved = 0
 
         for art_type in art_types:
             if art_type not in self.ART_TYPES:
-                self._log.warning("Unsupported artwork type %r; skipping.", art_type)
+                self._log.warning(f"Unsupported artwork type {art_type!r}; skipping.")
                 continue
             if self._art_exists(album_dir, art_type):
-                self._log.debug("%s already exists for %s", art_type, album)
+                self._log.debug(f"{art_type} already exists for {album}")
                 if stats:
-                    stats.already_present += 1
+                    stats.add("already_present")
                 continue
 
             if pretend:
                 if stats:
-                    stats.would_fetch += 1
+                    stats.add("would_fetch")
                 for source in sources:
                     self._log.info(
-                        "[pretend] Would try %s from %s for %s",
-                        art_type,
-                        source,
-                        album,
+                        f"[pretend] Would try {art_type} from {source} for {album}"
                     )
                 continue
 
             cache_key = self._cache_key(album, art_type, sources)
             if self._should_skip_cached(album, cache_key, force):
                 if stats:
-                    stats.cached += 1
-                self._log.debug("Skipping cached no-artwork lookup for %s (%s)", album, art_type)
+                    stats.add("cached")
+                self._log.debug(
+                    f"Skipping cached no-artwork lookup for {album} ({art_type})"
+                )
                 continue
 
             failure_count = self._request_failures
@@ -196,32 +356,31 @@ class MoreArtPlugin(BeetsPlugin):
                                 width, height = (int(value) for value in resize_config)
                             except ValueError:
                                 self._log.warning(
-                                    "Invalid resize dimensions for %s: %r",
-                                    art_type,
-                                    resize_config,
+                                    f"Invalid resize dimensions for {art_type}: "
+                                    f"{resize_config!r}"
                                 )
                             else:
                                 self._resize_image(saved_path, width, height)
 
                     saved += 1
                     self._log.info(
-                        "%s ready for %s (from %s)",
-                        os.path.basename(saved_path),
-                        album,
-                        source,
+                        f"{os.path.basename(saved_path)} ready for {album} "
+                        f"(from {source})"
                     )
 
                 if saved:
                     self._clear_cached_negative(album, cache_key)
+                    album_saved += saved
                     if stats:
-                        stats.saved += saved
+                        stats.add("saved", saved)
                     break
             else:
                 if self._request_failures == failure_count:
                     self._cache_negative(album, cache_key)
                 if stats:
-                    stats.no_image += 1
-                self._log.warning("No valid %s found for %s", art_type, album)
+                    stats.add("no_image")
+                self._log.warning(f"No valid {art_type} found for {album}")
+        return album_saved
 
     def _cache_key(self, album: Any, art_type: str, sources: Sequence[str]) -> str:
         def secret_digest(value: Any) -> str:
@@ -310,7 +469,7 @@ class MoreArtPlugin(BeetsPlugin):
         }
         fetcher = fetchers.get(source)
         if fetcher is None:
-            self._log.warning("Unknown artwork source %r; skipping.", source)
+            self._log.warning(f"Unknown artwork source {source!r}; skipping.")
             return None
         return fetcher(album, art_type)
 
@@ -365,7 +524,7 @@ class MoreArtPlugin(BeetsPlugin):
         if image_format is None:
             self._request_failures += 1
             self._log.warning(
-                "%s did not return a valid %s image.", source, art_type
+                f"{source} did not return a valid {art_type} image."
             )
             return None
 
@@ -377,7 +536,7 @@ class MoreArtPlugin(BeetsPlugin):
         output_path = "%s.%s" % (base, output_format)
         if os.path.exists(output_path):
             if self._file_checksum(output_path) == hashlib.sha256(image_bytes).hexdigest():
-                self._log.debug("Skipping identical %s image: %s", art_type, output_path)
+                self._log.debug(f"Skipping identical {art_type} image: {output_path}")
                 return None
 
         download_path = "%s.download.%s" % (base, image_format)
@@ -396,9 +555,8 @@ class MoreArtPlugin(BeetsPlugin):
                     return output_path
                 except (OSError, subprocess.CalledProcessError) as error:
                     self._log.warning(
-                        "Could not convert %s image with ImageMagick: %s; saving original.",
-                        art_type,
-                        error,
+                        f"Could not convert {art_type} image with ImageMagick: "
+                        f"{error}; saving original."
                     )
                     output_path = "%s.%s" % (base, image_format)
 
@@ -425,7 +583,7 @@ class MoreArtPlugin(BeetsPlugin):
     def _edit_image(self, path: str, options: Sequence[str]) -> None:
         if not self._magick_bin:
             self._log.warning(
-                "ImageMagick is not installed; leaving artwork unchanged: %s", path
+                f"ImageMagick is not installed; leaving artwork unchanged: {path}"
             )
             return
 
@@ -437,7 +595,7 @@ class MoreArtPlugin(BeetsPlugin):
                 raise OSError("ImageMagick produced no output")
             os.replace(temporary_path, path)
         except (OSError, subprocess.CalledProcessError) as error:
-            self._log.warning("Image processing failed for %s: %s", path, error)
+            self._log.warning(f"Image processing failed for {path}: {error}")
         finally:
             if os.path.exists(temporary_path):
                 os.remove(temporary_path)
@@ -500,12 +658,12 @@ class MoreArtPlugin(BeetsPlugin):
         if isinstance(data, dict):
             return data
         self._request_failures += 1
-        self._log.warning("%s returned an unexpected response format.", source)
+        self._log.warning(f"{source} returned an unexpected response format.")
         return None
 
     def _invalid_response(self, source: str, detail: str) -> None:
         self._request_failures += 1
-        self._log.warning("%s returned an invalid %s response.", source, detail)
+        self._log.warning(f"{source} returned an invalid {detail} response.")
 
     def _response_url(self, value: Any, source: str) -> Optional[str]:
         if value is None or value == "":
@@ -563,13 +721,13 @@ class MoreArtPlugin(BeetsPlugin):
                     try:
                         image = self._download_image(image_url)
                     except (OSError, URLError) as error:
-                        self._log.warning("Fanart.tv image request failed: %s", error)
+                        self._log.warning(f"Fanart.tv image request failed: {error}")
                         continue
                     if image:
                         images.append(image)
             return images or None
         except (OSError, ValueError) as error:
-            self._log.warning("Fanart.tv request failed for %s: %s", mbid, error)
+            self._log.warning(f"Fanart.tv request failed for {mbid}: {error}")
             return None
 
     def _fetch_from_musicbrainz(
@@ -613,7 +771,7 @@ class MoreArtPlugin(BeetsPlugin):
                             image = self._download_image(image_url)
                         except (OSError, URLError) as error:
                             self._log.warning(
-                                "MusicBrainz image request failed: %s", error
+                                f"MusicBrainz image request failed: {error}"
                             )
                             continue
                         if image:
@@ -622,7 +780,7 @@ class MoreArtPlugin(BeetsPlugin):
                 images = images[:1]
             return images or None
         except (OSError, ValueError) as error:
-            self._log.warning("MusicBrainz request failed for %s: %s", mbid, error)
+            self._log.warning(f"MusicBrainz request failed for {mbid}: {error}")
             return None
 
     def _fetch_from_theaudiodb(
@@ -666,5 +824,7 @@ class MoreArtPlugin(BeetsPlugin):
             image = self._download_image(image_url)
             return [image] if image else None
         except (OSError, ValueError) as error:
-            self._log.warning("TheAudioDB request failed for %s - %s: %s", artist, title, error)
+            self._log.warning(
+                f"TheAudioDB request failed for {artist} - {title}: {error}"
+            )
             return None

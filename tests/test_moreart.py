@@ -1,4 +1,5 @@
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -6,6 +7,7 @@ import pytest
 from beets.library import Item, Library
 
 from beetsplug.moreart import MoreArtPlugin
+from beetsplug.moreart.plugin import ArtworkStats
 
 
 @pytest.mark.parametrize(
@@ -47,6 +49,83 @@ def test_provider_fetchers_reject_unexpected_response_shapes(source, response):
 
     assert result is None
     assert plugin._request_failures == 1
+
+
+def test_missing_art_log_interpolates_art_type_and_album(tmp_path):
+    plugin = MoreArtPlugin()
+    plugin._log = Mock()
+    plugin.config["sources"].set([])
+    plugin.config["types"].set(["back"])
+    plugin.config["cache_results"].set(False)
+    album = Mock(
+        path=str(tmp_path),
+        mb_albumid=None,
+        albumartist="Artist",
+        album="Album",
+    )
+
+    plugin._process_album(album)
+
+    plugin._log.warning.assert_called_once_with(f"No valid back found for {album}")
+
+
+def test_musicbrainz_error_log_includes_release_id_and_exception():
+    plugin = MoreArtPlugin()
+    plugin._log = Mock()
+    plugin._request_json = Mock(side_effect=OSError("connection failed"))
+    album = Mock(mb_albumid="known-release-id")
+
+    assert plugin._fetch_from_musicbrainz(album, "back") is None
+
+    message = plugin._log.warning.call_args.args[0]
+    assert message == (
+        "MusicBrainz request failed for known-release-id: connection failed"
+    )
+    assert len(plugin._log.warning.call_args.args) == 1
+
+
+def test_relative_album_path_uses_beets_absolute_filepath(tmp_path):
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    album = SimpleNamespace(
+        path=os.fsencode("Artist/Album"),
+        filepath=album_dir,
+    )
+
+    assert MoreArtPlugin._album_directory(album) == str(album_dir)
+
+
+def test_relative_album_path_uses_library_directory_without_filepath(tmp_path):
+    album_dir = tmp_path / "Artist" / "Album"
+    album_dir.mkdir(parents=True)
+    album = SimpleNamespace(
+        path=os.fsencode("Artist/Album"),
+        _db=SimpleNamespace(directory=str(tmp_path)),
+    )
+
+    assert MoreArtPlugin._album_directory(album) == str(album_dir)
+
+
+def test_missing_album_directory_is_skipped_before_fetching(tmp_path):
+    plugin = MoreArtPlugin()
+    plugin._log = Mock()
+    plugin.config["sources"].set(["musicbrainz"])
+    plugin.config["types"].set(["back"])
+    plugin.config["cache_results"].set(False)
+    plugin._fetch_from_source = Mock()
+    album = Mock(
+        path=str(tmp_path / "missing"),
+        mb_albumid="release-id",
+        albumartist="Artist",
+        album="Album",
+    )
+    stats = ArtworkStats()
+
+    result = plugin._process_album(album, stats=stats)
+
+    assert result == 0
+    assert stats.missing_path == 1
+    plugin._fetch_from_source.assert_not_called()
 
 
 def test_image_format_recognizes_common_formats():
@@ -275,3 +354,47 @@ def test_manual_command_prints_summary(capsys, tmp_path):
     assert "Artwork saved:        1" in output
     assert (tmp_path / "back.jpg").exists()
     library.albums.assert_called_once_with([])
+
+
+def test_manual_command_processes_albums_concurrently(capsys, tmp_path):
+    plugin = MoreArtPlugin()
+    plugin.config["sources"].set(["musicbrainz"])
+    plugin.config["types"].set(["back"])
+    plugin.config["cache_results"].set(False)
+    barrier = threading.Barrier(2)
+    albums = [
+        Mock(
+            path=str(tmp_path / "Artist" / "One"),
+            mb_albumid="release-one",
+            albumartist="Artist",
+            album="One",
+        ),
+        Mock(
+            path=str(tmp_path / "Artist" / "Two"),
+            mb_albumid="release-two",
+            albumartist="Artist",
+            album="Two",
+        ),
+    ]
+    for album in albums:
+        os.makedirs(album.path)
+    library = Mock()
+    library.albums.return_value = albums
+
+    def wait_for_second_worker(*_args):
+        barrier.wait(timeout=2)
+        return None
+
+    plugin._fetch_from_source = Mock(side_effect=wait_for_second_worker)
+    command = plugin.commands()[0]
+    command.func(
+        library,
+        SimpleNamespace(pretend=False, force=False, workers=2, quiet=False),
+        [],
+    )
+
+    output = capsys.readouterr().out
+    assert "[0001/0002]" in output
+    assert "[0002/0002]" in output
+    assert "Albums checked:       2" in output
+    assert "No image saved:       2" in output

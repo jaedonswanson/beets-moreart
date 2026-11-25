@@ -85,14 +85,16 @@ moreart:
   sources: [fanarttv, theaudiodb, musicbrainz]
   types: [discart, spine, back]
   run_on_import: yes
+  workers: 4
+  progress: yes
   timeout: 15
   cache_results: yes
   recheck_days: 30
   resize:
     enabled: yes
-    discart: [1000, 1000]
-    back: [750, 750]
-    spine: [35, 700]
+    discart: ["1000", "1000"]
+    back: ["750", "750"]
+    spine: ["35", "700"]
   fuzz: 15%
   background:
     multi_corner: yes
@@ -107,13 +109,15 @@ Adjust options as desired:
 | `sources` | `[fanarttv, theaudiodb, musicbrainz]` | Sources to try, in order |
 | `types` | `[discart, spine, back]` | Artwork types to fetch |
 | `run_on_import` | `yes` | Fetch artwork after an album is imported |
+| `workers` | `4` | Albums to process concurrently (maximum `16`) |
+| `progress` | `yes` | Show a per-album progress bar during manual runs |
 | `timeout` | `15` | Seconds to wait for each HTTP request |
 | `cache_results` | `yes` | Remember artwork types that had no usable result |
 | `recheck_days` | `30` | Days to wait before retrying cached no-artwork results |
 | `resize.enabled` | `yes` | Resize fetched images when ImageMagick is available |
-| `resize.discart` | `[1000, 1000]` | Disc art dimensions |
-| `resize.back` | `[750, 750]` | Back-cover dimensions |
-| `resize.spine` | `[35, 700]` | Spine dimensions |
+| `resize.discart` | `["1000", "1000"]` | Disc art dimensions |
+| `resize.back` | `["750", "750"]` | Back-cover dimensions |
+| `resize.spine` | `["35", "700"]` | Spine dimensions |
 | `fuzz` | `15%` | ImageMagick color tolerance for disc-art background removal |
 | `background.multi_corner` | `yes` | Remove the background from multiple disc-art edges |
 
@@ -132,6 +136,8 @@ imported. Existing artwork is left alone.
 | `beet moreart beatles` | Fetch artwork for matching albums |
 | `beet moreart --pretend` | Show planned source/type attempts without downloading or saving |
 | `beet moreart --force` | Ignore cached no-artwork results and search again |
+| `beet moreart -w 8` | Process up to 8 albums concurrently |
+| `beet moreart --quiet` | Hide the progress display |
 
 Only negative results are cached. Existing artwork is checked on disk each
 time, and changing the configured sources, API keys, or album metadata triggers
@@ -141,21 +147,23 @@ that already exists.
 After a manual run, MoreArt prints a summary:
 
 ```text
-========================================
+[0001/0014] [█───────────]   7% 00:01 Checked: Artist - Album
+[0002/0014] [██──────────]  14% 00:02 Saved 1: Artist - Another Album
+────────────────────────────────────────────────
   MoreArt summary
-  Albums checked:       12
-  Artwork saved:        18
-  Already present:      14
+  Albums checked:      14
+  Artwork saved:       18
+  Already present:     14
   Cached no-image:      2
   No image saved:       4
   Would fetch (pretend): 0
   Albums missing path:  0
-========================================
+────────────────────────────────────────────────
 ```
 
 ## How it Works
 
-1. Checks the album directory and skips artwork that is already present.
+1. Resolves the album directory, skips missing directories, and leaves existing artwork alone.
 2. Uses configured sources in order, falling back when no usable image is returned.
 3. Saves valid images beside the album files.
 4. Caches missing-artwork searches on the album record and retries after the configured interval.
