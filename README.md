@@ -4,16 +4,25 @@ A [beets](https://beets.io) plugin that fetches extra album artwork from
 Fanart.tv, MusicBrainz Cover Art Archive, and TheAudioDB.
 
 ## Quick Start
+### Installation
 
-Install from the MoreArt project directory for local testing:
+#### With pip
+
+After the package has been published to PyPI:
 
 ```bash
-pipx inject beets .
+pip install beets-moreart
 ```
 
-Enable the plugin in your Beets configuration:
+#### With pipx
 
-```yaml
+After the package has been published to PyPI:
+
+```bash
+pipx inject beets beets-moreart
+```
+
+```
 plugins:
   - moreart
 ```
@@ -40,36 +49,6 @@ Beets' built-in `fetchart` plugin fetches front-cover artwork. **beets-moreart**
 looks for additional artwork: disc art, spine images, and back covers. It searches Fanart.tv, MusicBrainz Cover Art Archive, and TheAudioDB, then saves the results beside the album's music files.
 
 MusicBrainz lookups use the album's release ID. Fanart.tv and TheAudioDB credentials are optional; sources without a configured key are skipped.
-
-## Installation
-
-### With pip
-
-After the package has been published to PyPI:
-
-```bash
-pip install beets-moreart
-```
-
-### With pipx
-
-After the package has been published to PyPI:
-
-```bash
-pipx inject beets beets-moreart
-```
-
-### From this checkout
-
-Run these commands from the MoreArt project directory. Use the `pipx` command
-when Beets is installed in a pipx-managed environment; otherwise use pip with
-the same Python environment as Beets.
-
-```bash
-pipx inject beets .
-# Or, when Beets and the plugin share a Python environment:
-python -m pip install .
-```
 
 ## Configuration
 
