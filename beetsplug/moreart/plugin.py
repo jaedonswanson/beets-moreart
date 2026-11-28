@@ -1,5 +1,7 @@
 """Fetch additional album artwork from Fanart.tv, MusicBrainz, and TheAudioDB."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -9,9 +11,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -47,8 +50,14 @@ class ArtworkStats:
             setattr(self, field, getattr(self, field) + amount)
 
     def print_summary(self, use_color: bool = False) -> None:
-        colors = _Colors if use_color else type(
-            "_NoColors", (), {key: "" for key in vars(_Colors) if not key.startswith("_")}
+        colors = (
+            _Colors
+            if use_color
+            else type(
+                "_NoColors",
+                (),
+                {key: "" for key in vars(_Colors) if not key.startswith("_")},
+            )
         )
         with self._lock:
             values = {
@@ -99,8 +108,8 @@ class ArtworkProgress:
             artist = album.albumartist or "Unknown artist"
             title = album.album or "Unknown album"
             color = (
-                _Colors.GREEN if saved else _Colors.YELLOW
-            ) if self.use_color else ""
+                (_Colors.GREEN if saved else _Colors.YELLOW) if self.use_color else ""
+            )
             reset = _Colors.RESET if self.use_color else ""
             status = f"Saved {saved}" if saved else "Checked"
             print(
@@ -115,7 +124,16 @@ class MoreArtPlugin(BeetsPlugin):
     """Fetch disc, spine, and back artwork for albums."""
 
     ART_TYPES = ("discart", "spine", "back")
-    IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff")
+    IMAGE_EXTENSIONS = (
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".tif",
+        ".tiff",
+    )
     MAX_WORKERS = 16
 
     def __init__(self) -> None:
@@ -177,23 +195,14 @@ class MoreArtPlugin(BeetsPlugin):
 
     @staticmethod
     def _album_directory(album: Any) -> str:
-        album_dir = syspath(album.path)
+        album_dir = os.fsdecode(album.path)  # no syspath yet
         if not os.path.isabs(album_dir):
-            filepath = getattr(album, "filepath", None)
-            if filepath is not None:
-                absolute_filepath = os.fspath(filepath)
-                if os.path.isabs(absolute_filepath):
-                    album_dir = absolute_filepath
+            library_dir = getattr(getattr(album, "_db", None), "directory", None)
+            if library_dir:
+                album_dir = os.path.join(os.fsdecode(library_dir), album_dir)
+        return syspath(os.path.abspath(album_dir))
 
-            if not os.path.isabs(album_dir):
-                library = getattr(album, "_db", None)
-                library_dir = getattr(library, "directory", None)
-                if library_dir:
-                    album_dir = os.path.join(syspath(library_dir), album_dir)
-
-        return os.path.abspath(album_dir)
-
-    def commands(self) -> List[Any]:
+    def commands(self) -> list[Any]:
         from beets.ui import Subcommand
 
         cmd = Subcommand(
@@ -237,9 +246,8 @@ class MoreArtPlugin(BeetsPlugin):
                 workers = self.config["workers"].get(int)
             workers = self._validate_workers(workers)
             stats = ArtworkStats()
-            show_progress = (
-                self.config["progress"].get(bool)
-                and not getattr(opts, "quiet", False)
+            show_progress = self.config["progress"].get(bool) and not getattr(
+                opts, "quiet", False
             )
             progress = (
                 ArtworkProgress(len(albums), bool(self._use_color))
@@ -280,7 +288,7 @@ class MoreArtPlugin(BeetsPlugin):
         album: Any,
         pretend: bool = False,
         force: bool = False,
-        stats: Optional[ArtworkStats] = None,
+        stats: ArtworkStats | None = None,
     ) -> int:
         if stats:
             stats.add("albums_checked")
@@ -339,9 +347,9 @@ class MoreArtPlugin(BeetsPlugin):
                 saved = 0
                 for index, image_bytes in enumerate(images, start=1):
                     if art_type == "discart" and len(images) > 1:
-                        filename = "discart%d.jpg" % index
+                        filename = f"discart {index}.jpg"
                     else:
-                        filename = "%s.jpg" % art_type
+                        filename = f"{art_type}.jpg"
                     path = os.path.join(album_dir, filename)
                     saved_path = self._save_image(path, image_bytes, source, art_type)
                     if not saved_path:
@@ -401,7 +409,7 @@ class MoreArtPlugin(BeetsPlugin):
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _read_album_cache(album: Any) -> Dict[str, str]:
+    def _read_album_cache(album: Any) -> dict[str, str]:
         value = album.get("moreart_cache")
         if not isinstance(value, str) or not value:
             return {}
@@ -428,7 +436,7 @@ class MoreArtPlugin(BeetsPlugin):
             return True
         return False
 
-    def _write_album_cache(self, album: Any, cache: Dict[str, str]) -> None:
+    def _write_album_cache(self, album: Any, cache: dict[str, str]) -> None:
         album["moreart_cache"] = json.dumps(cache, sort_keys=True)
         album.store(inherit=False)
 
@@ -461,7 +469,7 @@ class MoreArtPlugin(BeetsPlugin):
 
     def _fetch_from_source(
         self, source: str, album: Any, art_type: str
-    ) -> Optional[List[bytes]]:
+    ) -> list[bytes] | None:
         fetchers = {
             "fanarttv": self._fetch_from_fanarttv,
             "musicbrainz": self._fetch_from_musicbrainz,
@@ -490,7 +498,7 @@ class MoreArtPlugin(BeetsPlugin):
         )
 
     @staticmethod
-    def _image_format(image_bytes: bytes) -> Optional[str]:
+    def _image_format(image_bytes: bytes) -> str | None:
         if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
             return "png"
         if image_bytes.startswith(b"\xff\xd8\xff"):
@@ -519,13 +527,11 @@ class MoreArtPlugin(BeetsPlugin):
 
     def _save_image(
         self, path: str, image_bytes: bytes, source: str, art_type: str
-    ) -> Optional[str]:
+    ) -> str | None:
         image_format = self._image_format(image_bytes)
         if image_format is None:
             self._request_failures += 1
-            self._log.warning(
-                f"{source} did not return a valid {art_type} image."
-            )
+            self._log.warning(f"{source} did not return a valid {art_type} image.")
             return None
 
         base, _ = os.path.splitext(path)
@@ -533,15 +539,18 @@ class MoreArtPlugin(BeetsPlugin):
             output_format = "png" if art_type == "discart" else "jpg"
         else:
             output_format = image_format
-        output_path = "%s.%s" % (base, output_format)
+        output_path = f"{base}.{output_format}"
         if os.path.exists(output_path):
-            if self._file_checksum(output_path) == hashlib.sha256(image_bytes).hexdigest():
+            if (
+                self._file_checksum(output_path)
+                == hashlib.sha256(image_bytes).hexdigest()
+            ):
                 self._log.debug(f"Skipping identical {art_type} image: {output_path}")
                 return None
 
-        download_path = "%s.download.%s" % (base, image_format)
-        converted_path = "%s.tmp.%s" % (base, output_format)
-        temporary_path = "%s.tmp.%s" % (base, image_format)
+        download_path = f"{base}.download.{image_format}"
+        converted_path = f"{base}.tmp.{output_format}"
+        temporary_path = f"{base}.tmp.{image_format}"
         try:
             with open(download_path, "wb") as image_file:
                 image_file.write(image_bytes)
@@ -549,7 +558,10 @@ class MoreArtPlugin(BeetsPlugin):
             if self._magick_bin:
                 try:
                     self._run_magick([download_path, converted_path])
-                    if not os.path.isfile(converted_path) or os.path.getsize(converted_path) == 0:
+                    if (
+                        not os.path.isfile(converted_path)
+                        or os.path.getsize(converted_path) == 0
+                    ):
                         raise OSError("ImageMagick produced no output")
                     os.replace(converted_path, output_path)
                     return output_path
@@ -558,7 +570,7 @@ class MoreArtPlugin(BeetsPlugin):
                         f"Could not convert {art_type} image with ImageMagick: "
                         f"{error}; saving original."
                     )
-                    output_path = "%s.%s" % (base, image_format)
+                    output_path = f"{base}.{image_format}"
 
             with open(temporary_path, "wb") as image_file:
                 image_file.write(image_bytes)
@@ -588,10 +600,13 @@ class MoreArtPlugin(BeetsPlugin):
             return
 
         base, extension = os.path.splitext(path)
-        temporary_path = "%s.processing%s" % (base, extension)
+        temporary_path = f"{base}.processing{extension}"
         try:
             self._run_magick([path, *options, temporary_path])
-            if not os.path.isfile(temporary_path) or os.path.getsize(temporary_path) == 0:
+            if (
+                not os.path.isfile(temporary_path)
+                or os.path.getsize(temporary_path) == 0
+            ):
                 raise OSError("ImageMagick produced no output")
             os.replace(temporary_path, path)
         except (OSError, subprocess.CalledProcessError) as error:
@@ -625,12 +640,10 @@ class MoreArtPlugin(BeetsPlugin):
     def _resize_image(self, path: str, width: int, height: int) -> None:
         self._edit_image(path, ["-resize", "%dx%d!" % (width, height)])
 
-    def _request_bytes(
-        self, url: str, params: Optional[Dict[str, str]] = None
-    ) -> bytes:
+    def _request_bytes(self, url: str, params: dict[str, str] | None = None) -> bytes:
         if params:
             separator = "&" if "?" in url else "?"
-            url = "%s%s%s" % (url, separator, urlencode(params))
+            url = f"{url}{separator}{urlencode(params)}"
         request = Request(url, headers={"User-Agent": "beets-moreart"})
         try:
             with urlopen(request, timeout=self.config["timeout"].get(int)) as response:
@@ -643,18 +656,14 @@ class MoreArtPlugin(BeetsPlugin):
             self._request_failures += 1
             raise
 
-    def _request_json(
-        self, url: str, params: Optional[Dict[str, str]] = None
-    ) -> Any:
+    def _request_json(self, url: str, params: dict[str, str] | None = None) -> Any:
         try:
             return json.loads(self._request_bytes(url, params))
         except ValueError:
             self._request_failures += 1
             raise
 
-    def _response_mapping(
-        self, data: Any, source: str
-    ) -> Optional[Dict[str, Any]]:
+    def _response_mapping(self, data: Any, source: str) -> dict[str, Any] | None:
         if isinstance(data, dict):
             return data
         self._request_failures += 1
@@ -665,7 +674,7 @@ class MoreArtPlugin(BeetsPlugin):
         self._request_failures += 1
         self._log.warning(f"{source} returned an invalid {detail} response.")
 
-    def _response_url(self, value: Any, source: str) -> Optional[str]:
+    def _response_url(self, value: Any, source: str) -> str | None:
         if value is None or value == "":
             return None
         if not isinstance(value, str):
@@ -681,12 +690,10 @@ class MoreArtPlugin(BeetsPlugin):
             return None
         return value
 
-    def _download_image(self, url: str) -> Optional[bytes]:
+    def _download_image(self, url: str) -> bytes | None:
         return self._request_bytes(url)
 
-    def _fetch_from_fanarttv(
-        self, album: Any, art_type: str
-    ) -> Optional[List[bytes]]:
+    def _fetch_from_fanarttv(self, album: Any, art_type: str) -> list[bytes] | None:
         api_key = self.config["fanarttv_key"].get()
         mbid = album.mb_albumid
         if not api_key or not mbid:
@@ -730,17 +737,13 @@ class MoreArtPlugin(BeetsPlugin):
             self._log.warning(f"Fanart.tv request failed for {mbid}: {error}")
             return None
 
-    def _fetch_from_musicbrainz(
-        self, album: Any, art_type: str
-    ) -> Optional[List[bytes]]:
+    def _fetch_from_musicbrainz(self, album: Any, art_type: str) -> list[bytes] | None:
         mbid = album.mb_albumid
         if not mbid or art_type == "spine":
             return None
 
         try:
-            data = self._request_json(
-                "https://coverartarchive.org/release/%s" % mbid
-            )
+            data = self._request_json("https://coverartarchive.org/release/%s" % mbid)
             data = self._response_mapping(data, "MusicBrainz")
             if data is None:
                 return None
@@ -763,9 +766,7 @@ class MoreArtPlugin(BeetsPlugin):
                     or art_type == "discart"
                     and "Medium" in image_types
                 ):
-                    image_url = self._response_url(
-                        entry.get("image"), "MusicBrainz"
-                    )
+                    image_url = self._response_url(entry.get("image"), "MusicBrainz")
                     if image_url:
                         try:
                             image = self._download_image(image_url)
@@ -783,9 +784,7 @@ class MoreArtPlugin(BeetsPlugin):
             self._log.warning(f"MusicBrainz request failed for {mbid}: {error}")
             return None
 
-    def _fetch_from_theaudiodb(
-        self, album: Any, art_type: str
-    ) -> Optional[List[bytes]]:
+    def _fetch_from_theaudiodb(self, album: Any, art_type: str) -> list[bytes] | None:
         api_key = self.config["theaudiodb_key"].get()
         artist = album.albumartist
         title = album.album
